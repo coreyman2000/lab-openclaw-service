@@ -1,0 +1,52 @@
+---
+# Default settings for tenant VMs
+
+# VM Configuration
+tenant_vm_template: "ubuntu-24.04-cloudimg"
+tenant_vm_storage: "local-zfs"
+tenant_vm_network_bridge: "vmbr0"
+tenant_vm_gateway: "10.0.20.1"
+tenant_vm_dns: "10.0.20.1"
+
+# Tenant Tiers (override per tenant in host_vars)
+tenant_tiers:
+  basic:
+    cores: 2
+    memory: 4096
+    disk: 20
+    openclaw_instances: 2
+    max_users: 10
+  
+  standard:
+    cores: 4
+    memory: 8192
+    disk: 40
+    openclaw_instances: 5
+    max_users: 25
+  
+  premium:
+    cores: 8
+    memory: 16384
+    disk: 80
+    openclaw_instances: 10
+    max_users: 50
+
+# Default to standard tier
+tenant_tier: "standard"
+
+# OpenClaw Configuration
+openclaw_image: "ghcr.io/openclaw/openclaw:latest"
+openclaw_base_port: 3000
+openclaw_data_volume: "/opt/openclaw/data"
+
+# Default model endpoints (override with actual Ollama IPs)
+default_ollama_endpoints:
+  - "http://10.0.10.11:11434"
+  - "http://10.0.10.12:11434"
+
+# Available models for tenants (populated from Ollama)
+available_models:
+  - "llama3.2"
+  - "mistral"
+  - "codellama"
+  - "gemma:7b"

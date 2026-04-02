@@ -1,0 +1,126 @@
+---
+# Deploy nginx API gateway with key authentication for Ollama backends
+# Run this BEFORE deploying tenant VMs
+
+- name: Deploy Secure Ollama Gateway
+  hosts: ollama_backends
+  become: true
+  gather_facts: true
+
+  vars:
+    gateway_port: 11435  # Public-facing secure port
+    ollama_internal_port: 11434  # Internal Ollama port (localhost only)
+    
+  tasks:
+    - name: Skip if not GPU node
+      ansible.builtin.meta: end_play
+      when: not (gpu_node | default(false))
+
+    - name: Install nginx and lua module
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - libnginx-mod-http-lua
+          - lua-json
+        state: present
+        update_cache: true
+
+    - name: Create nginx config directory
+      ansible.builtin.file:
+        path: /etc/nginx/api-keys
+        state: directory
+        mode: '0750'
+
+    - name: Create API key store
+      ansible.builtin.template:
+        src: api-keys.json.j2
+        dest: /etc/nginx/api-keys/keys.json
+        mode: '0600'
+      vars:
+        # Generate tenant API keys - these will be distributed to tenant VMs
+        tenant_keys:
+          - tenant: "team-alpha"
+            key: "{{ lookup('community.general.random_string', min_lower=12, max_lower=12) }}"
+          - tenant: "team-beta"  
+            key: "{{ lookup('community.general.random_string', min_lower=12, max_lower=12) }}"
+          - tenant: "team-gamma"
+            key: "{{ lookup('community.general.random_string', min_lower=12, max_lower=12) }}"
+
+    - name: Save generated keys for later
+      ansible.builtin.copy:
+        content: "{{ tenant_keys | to_nice_json }}"
+        dest: /opt/ollama-gateway/tenant-keys.json
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+      run_once: true
+
+    - name: Deploy nginx gateway config
+      ansible.builtin.template:
+        src: nginx-ollama-gateway.conf.j2
+        dest: /etc/nginx/sites-available/ollama-gateway
+        mode: '0644'
+      vars:
+        listen_port: "{{ gateway_port }}"
+        upstream_port: "{{ ollama_internal_port }}"
+
+    - name: Enable nginx site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/ollama-gateway
+        dest: /etc/nginx/sites-enabled/ollama-gateway
+        state: link
+
+    - name: Remove default site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Test nginx config
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+    - name: Restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    - name: Configure firewall for secure gateway
+      ansible.builtin.ufw:
+        rule: allow
+        port: "{{ gateway_port }}"
+        proto: tcp
+        from_ip: "{{ tenant_network | default('10.0.20.0/24') }}"
+
+    - name: Block direct Ollama access from tenant network
+      ansible.builtin.ufw:
+        rule: deny
+        port: "{{ ollama_internal_port }}"
+        proto: tcp
+        from_ip: "{{ tenant_network | default('10.0.20.0/24') }}"
+
+    - name: Allow Ollama from localhost only
+      ansible.builtin.ufw:
+        rule: allow
+        port: "{{ ollama_internal_port }}"
+        proto: tcp
+        from_ip: "127.0.0.1"
+
+    - name: Display gateway endpoints
+      ansible.builtin.debug:
+        msg: |
+          🔐 Secure Ollama Gateway Deployed
+          =================================
+          
+          Secure Endpoint: http://{{ ansible_host }}:{{ gateway_port }}
+          
+          Required Header:
+            X-API-Key: <tenant-api-key>
+          
+          Tenant API Keys saved to: /opt/ollama-gateway/tenant-keys.json
+          (Distribute to respective tenant VMs during provisioning)
+          
+          Example Request:
+            curl -H "X-API-Key: <key>" http://{{ ansible_host }}:{{ gateway_port }}/api/tags
+          
+          ⚠️  Direct Ollama port ({{ ollama_internal_port }}) is now blocked from tenant network

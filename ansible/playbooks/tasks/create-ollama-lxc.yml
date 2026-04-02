@@ -1,0 +1,83 @@
+---
+# Task: Create Ollama LXC Container
+
+- name: Calculate LXC ID
+  ansible.builtin.set_fact:
+    lxc_id: "{{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + gpu_index + 1 }}"
+    lxc_ip: "10.0.10.{{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + gpu_index + 1 }}"
+    lxc_hostname: "ollama-{{ inventory_hostname | regex_replace('pve-', '') }}-gpu{{ gpu_index }}"
+
+- name: Check if LXC exists
+  ansible.builtin.shell: |
+    pct list | grep -q "^{{ lxc_id }} " && echo "exists" || echo "new"
+  register: lxc_status
+  changed_when: false
+
+- name: Stop and destroy existing LXC (if exists)
+  ansible.builtin.shell: |
+    pct stop {{ lxc_id }} 2>/dev/null || true
+    pct destroy {{ lxc_id }} 2>/dev/null || true
+  when: lxc_status.stdout == "exists"
+
+- name: Create Ollama LXC container
+  ansible.builtin.shell: |
+    pct create {{ lxc_id }} {{ ollama_storage }}:vztmpl/{{ ollama_lxc_template }}.tar.zst \
+      --hostname {{ lxc_hostname }} \
+      --cores {{ ollama_cores }} \
+      --memory {{ ollama_memory }} \
+      --swap 4096 \
+      --rootfs {{ ollama_storage }}:32 \
+      --net0 name=eth0,bridge=vmbr0,ip={{ lxc_ip }}/24,gw=10.0.10.1 \
+      --features nesting=1 \
+      --unprivileged 0
+  args:
+    creates: "/etc/pve/lxc/{{ lxc_id }}.conf"
+
+- name: Configure GPU passthrough for LXC
+  ansible.builtin.blockinfile:
+    path: "/etc/pve/lxc/{{ lxc_id }}.conf"
+    block: |
+      lxc.cgroup2.devices.allow: c 195:* rwm
+      lxc.cgroup2.devices.allow: c 506:* rwm
+      lxc.mount.entry: /dev/nvidia{{ gpu_index }} dev/nvidia{{ gpu_index }} none bind,optional,create=file
+      lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file
+      lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file
+      lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file
+      lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file
+
+- name: Start LXC container
+  ansible.builtin.shell: |
+    pct start {{ lxc_id }}
+
+- name: Wait for LXC to be reachable
+  ansible.builtin.wait_for:
+    host: "{{ lxc_ip }}"
+    port: 22
+    timeout: 120
+    delay: 5
+
+- name: Install Ollama in LXC
+  ansible.builtin.shell: |
+    pct exec {{ lxc_id }} -- bash -c "
+      apt-get update && \
+      apt-get install -y curl wget ca-certificates && \
+      curl -fsSL https://ollama.com/install.sh | sh
+    "
+  args:
+    executable: /bin/bash
+
+- name: Configure Ollama to bind to all interfaces
+  ansible.builtin.shell: |
+    pct exec {{ lxc_id }} -- bash -c "
+      mkdir -p /etc/systemd/system/ollama.service.d/ && \
+      cat > /etc/systemd/system/ollama.service.d/override.conf << 'EOF'
+[Service]
+Environment=OLLAMA_HOST=0.0.0.0:11434
+Environment=CUDA_VISIBLE_DEVICES=0
+EOF
+      systemctl daemon-reload && \
+      systemctl enable ollama && \
+      systemctl restart ollama
+    "
+  args:
+    executable: /bin/bash

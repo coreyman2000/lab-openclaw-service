@@ -1,0 +1,45 @@
+# OpenClaw Configuration
+# Tenant: {{ tenant_name }}
+# Instance: {{ instance_num | default(1) }}
+
+# Gateway configuration
+gateway:
+  bind: "0.0.0.0:3000"
+  remote:
+    # Optional: Configure if using external gateway
+    url: ""
+
+# Model configuration - Connect to shared Ollama pool
+models:
+  default: "llama3.2"
+  providers:
+    ollama:
+      type: "openai-compatible"
+      base_url: "{{ ollama_endpoints | default(default_ollama_endpoints) | first }}"
+      api_key: ""  # Ollama doesn't require API key
+      models:
+        - name: "llama3.2"
+          display_name: "Llama 3.2"
+        - name: "mistral"
+          display_name: "Mistral"
+        - name: "codellama"
+          display_name: "CodeLlama"
+        - name: "gemma:7b"
+          display_name: "Gemma 7B"
+
+# Plugins
+plugins:
+  enabled:
+    - "web-search"
+    - "web-fetch"
+    - "memory"
+
+# Memory configuration
+memory:
+  enabled: true
+  storage_path: "/data/memory"
+
+# Logging
+logging:
+  level: "info"
+  format: "json"

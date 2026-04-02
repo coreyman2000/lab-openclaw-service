@@ -1,0 +1,221 @@
+---
+# Tenant Operations Playbook
+# Usage: ansible-playbook -i inventory/ tenant-ops.yml -e "operation=status tenant=team-alpha"
+
+- name: Tenant Operations
+  hosts: tenant_vms
+  become: true
+  gather_facts: false
+
+  vars_prompt:
+    - name: operation
+      prompt: |
+        Select operation:
+        - status: Show OpenClaw status
+        - restart: Restart all OpenClaw instances
+        - logs: Show recent logs
+        - update: Update OpenClaw image
+        - add-instance: Add new OpenClaw instance
+        - remove: Delete tenant VM
+      private: false
+      default: "status"
+
+    - name: target_tenant
+      prompt: "Enter tenant name (or 'all' for all tenants)"
+      private: false
+      default: "all"
+
+  vars:
+    is_target_tenant: "{{ target_tenant == 'all' or inventory_hostname == 'openclaw-' + target_tenant }}"
+
+  tasks:
+    - name: Skip non-target tenants
+      ansible.builtin.meta: skip_host
+      when: not is_target_tenant | bool
+
+    # STATUS OPERATION
+    - name: Get OpenClaw status
+      when: operation == "status"
+      block:
+        - name: Check Docker containers
+          ansible.builtin.shell: |
+            docker ps --filter "name=openclaw" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+          register: docker_status
+          changed_when: false
+
+        - name: Get resource usage
+          ansible.builtin.shell: |
+            echo "=== CPU/Memory Usage ==="
+            docker stats --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+          register: resource_usage
+          changed_when: false
+
+        - name: Display status
+          ansible.builtin.debug:
+            msg: |
+              Tenant: {{ tenant_name | default(inventory_hostname | regex_replace('openclaw-', '')) }}
+              Host: {{ inventory_hostname }}
+              
+              Container Status:
+              {{ docker_status.stdout }}
+              
+              {{ resource_usage.stdout }}
+
+    # RESTART OPERATION
+    - name: Restart OpenClaw services
+      when: operation == "restart"
+      block:
+        - name: Restart containers
+          community.docker.docker_compose_v2:
+            project_src: "/opt/openclaw"
+            state: restarted
+            wait: true
+
+        - name: Verify restart
+          ansible.builtin.shell: |
+            docker ps --filter "name=openclaw" --format "{{.Names}}: {{.Status}}"
+          register: restart_status
+          changed_when: false
+
+        - name: Display restart status
+          ansible.builtin.debug:
+            msg: |
+              Restarted OpenClaw for {{ tenant_name | default(inventory_hostname) }}:
+              {{ restart_status.stdout }}
+
+    # LOGS OPERATION
+    - name: Show OpenClaw logs
+      when: operation == "logs"
+      block:
+        - name: Get last 50 lines from all containers
+          ansible.builtin.shell: |
+            docker ps --filter "name=openclaw" -q | xargs -I {} sh -c 'echo "=== {} ===" && docker logs --tail 50 {}'
+          register: container_logs
+          changed_when: false
+
+        - name: Display logs
+          ansible.builtin.debug:
+            msg: |
+              Logs for {{ tenant_name | default(inventory_hostname) }}:
+              {{ container_logs.stdout }}
+
+    # UPDATE OPERATION
+    - name: Update OpenClaw image
+      when: operation == "update"
+      block:
+        - name: Pull latest image
+          community.docker.docker_image:
+            name: "{{ openclaw_image | default('ghcr.io/openclaw/openclaw:latest') }}"
+            source: pull
+            force_source: true
+
+        - name: Recreate containers with new image
+          community.docker.docker_compose_v2:
+            project_src: "/opt/openclaw"
+            state: present
+            pull: always
+            wait: true
+
+        - name: Verify update
+          ansible.builtin.shell: |
+            docker images | grep openclaw
+          register: image_info
+          changed_when: false
+
+        - name: Display update status
+          ansible.builtin.debug:
+            msg: |
+              Updated OpenClaw for {{ tenant_name | default(inventory_hostname) }}:
+              {{ image_info.stdout }}
+
+    # ADD INSTANCE OPERATION
+    - name: Add new OpenClaw instance
+      when: operation == "add-instance"
+      block:
+        - name: Get current instance count
+          ansible.builtin.shell: |
+            docker ps --filter "name=openclaw" --format "{{.Names}}" | wc -l
+          register: current_count
+          changed_when: false
+
+        - name: Calculate new instance number
+          ansible.builtin.set_fact:
+            new_instance_num: "{{ current_count.stdout | int + 1 }}"
+
+        - name: Create data directory
+          ansible.builtin.file:
+            path: "/opt/openclaw/instance-{{ new_instance_num }}"
+            state: directory
+            mode: '0755'
+            owner: "openclaw"
+            group: "openclaw"
+
+        - name: Generate config for new instance
+          ansible.builtin.template:
+            src: "openclaw-config.yml.j2"
+            dest: "/opt/openclaw/instance-{{ new_instance_num }}/config.yaml"
+            mode: '0644'
+            owner: "openclaw"
+            group: "openclaw"
+          vars:
+            instance_num: "{{ new_instance_num }}"
+
+        - name: Regenerate Docker Compose
+          ansible.builtin.template:
+            src: "docker-compose.yml.j2"
+            dest: "/opt/openclaw/docker-compose.yml"
+            mode: '0644'
+
+        - name: Update instance count
+          ansible.builtin.set_fact:
+            openclaw_instances: "{{ new_instance_num }}"
+
+        - name: Start new container
+          community.docker.docker_compose_v2:
+            project_src: "/opt/openclaw"
+            state: present
+            wait: true
+
+        - name: Display new instance info
+          ansible.builtin.debug:
+            msg: |
+              Added new OpenClaw instance {{ new_instance_num }} for {{ tenant_name | default(inventory_hostname) }}
+              New instance URL: http://{{ ansible_host | default(inventory_hostname) }}:{{ 3000 + new_instance_num | int - 1 }}
+
+    # REMOVE OPERATION
+    - name: Remove tenant VM
+      when: operation == "remove"
+      block:
+        - name: Confirm deletion
+          ansible.builtin.pause:
+            prompt: "⚠️  WARNING: This will DELETE the tenant VM {{ inventory_hostname }}. Type 'DELETE' to confirm"
+          register: confirm_delete
+
+        - name: Fail if not confirmed
+          ansible.builtin.fail:
+            msg: "Deletion cancelled. Type 'DELETE' to confirm."
+          when: confirm_delete.user_input != "DELETE"
+
+        - name: Get VM ID from Proxmox
+          ansible.builtin.shell: |
+            # This needs to run on Proxmox host
+            echo "TODO: Implement VM deletion via Proxmox API"
+          delegate_to: "{{ groups['proxmox_hosts'][0] }}"
+          register: vm_deletion
+
+- name: Cleanup removed tenant from inventory
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  when: operation == "remove"
+  tasks:
+    - name: Remove from inventory files
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../inventory/host_vars/openclaw-{{ target_tenant }}.yml"
+        state: absent
+
+    - name: Remove from hosts.yml
+      ansible.builtin.lineinfile:
+        path: "{{ playbook_dir }}/../inventory/hosts.yml"
+        regexp: "openclaw-{{ target_tenant }}"
+        state: absent

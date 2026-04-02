@@ -1,0 +1,125 @@
+# Ollama Secure API Gateway
+# Blocks direct access, requires API key for all requests
+
+upstream ollama_backend {
+    server 127.0.0.1:{{ upstream_port | default(11434) }};
+    keepalive 32;
+}
+
+# Lua script to validate API keys
+lua_shared_dict api_keys 10m;
+
+init_by_lua_block {
+    local json = require("cjson")
+    local keys = {}
+    
+    -- Load API keys from file
+    local f = io.open("/etc/nginx/api-keys/keys.json", "r")
+    if f then
+        local content = f:read("*all")
+        f:close()
+        local data = json.decode(content)
+        for _, entry in ipairs(data) do
+            keys[entry.key] = entry.tenant
+        end
+    end
+    
+    -- Store in shared dict
+    for k, v in pairs(keys) do
+        ngx.shared.api_keys:set(k, v, 0)
+    end
+}
+
+server {
+    listen {{ listen_port | default(11435) }};
+    server_name _;
+    
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    
+    # Log format including tenant
+    log_format ollama '$remote_addr - $tenant [$time_local] '
+                      '"$request" $status $body_bytes_sent '
+                      '"$http_referer" "$http_user_agent"';
+    access_log /var/log/nginx/ollama-access.log ollama;
+    
+    # Health check endpoint (no auth required)
+    location /health {
+        access_log off;
+        return 200 "OK\n";
+        add_header Content-Type text/plain;
+    }
+    
+    # All other endpoints require API key
+    location / {
+        # Rate limiting per tenant
+        limit_req_zone $tenant zone=tenant_limit:10m rate=100r/m;
+        limit_req zone=tenant_limit burst=20 nodelay;
+        
+        # Validate API key
+        access_by_lua_block {
+            local api_key = ngx.var.http_x_api_key
+            
+            if not api_key or api_key == "" then
+                ngx.status = 401
+                ngx.header["Content-Type"] = "application/json"
+                ngx.say('{"error": "Missing X-API-Key header"}')
+                ngx.exit(401)
+            end
+            
+            local tenant = ngx.shared.api_keys:get(api_key)
+            if not tenant then
+                ngx.status = 403
+                ngx.header["Content-Type"] = "application/json"
+                ngx.say('{"error": "Invalid API key"}')
+                ngx.exit(403)
+            end
+            
+            -- Set tenant variable for logging
+            ngx.var.tenant = tenant
+            
+            -- Add tenant header to upstream
+            ngx.req.set_header("X-Tenant-ID", tenant)
+        }
+        
+        # Proxy to Ollama
+        proxy_pass http://ollama_backend;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        
+        # WebSocket support for streaming
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        
+        # Timeouts for long-running requests
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 300s;
+        
+        # Buffer settings
+        proxy_buffering off;
+        proxy_cache off;
+        
+        # Body size limit
+        client_max_body_size 100M;
+    }
+}
+
+# Block direct access to Ollama from external IPs
+server {
+    listen {{ upstream_port | default(11434) }};
+    server_name _;
+    
+    # Only allow from localhost
+    allow 127.0.0.1;
+    deny all;
+    
+    location / {
+        proxy_pass http://ollama_backend;
+    }
+}

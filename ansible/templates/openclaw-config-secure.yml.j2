@@ -1,0 +1,51 @@
+# OpenClaw Configuration - Secure Multi-Tenant
+# Tenant: {{ tenant_name }}
+# Instance: {{ instance_num | default(1) }}
+
+# Gateway configuration
+gateway:
+  bind: "0.0.0.0:3000"
+
+# Model configuration - Connect to secure Ollama gateway
+models:
+  default: "llama3.2"
+  providers:
+    ollama:
+      type: "openai-compatible"
+      # Use secure gateway endpoint with API key
+      base_url: "{{ ollama_secure_endpoints | default(['http://10.0.10.11:11435', 'http://10.0.10.12:11435']) | first }}"
+      api_key: "{{ tenant_api_key | default('') }}"  # Populated during provisioning
+      # Custom headers for authentication
+      extra_headers:
+        X-API-Key: "{{ tenant_api_key | default('') }}"
+      models:
+        - name: "llama3.2"
+          display_name: "Llama 3.2"
+        - name: "mistral"
+          display_name: "Mistral"
+        - name: "codellama"
+          display_name: "CodeLlama"
+        - name: "gemma:7b"
+          display_name: "Gemma 7B"
+
+# Plugins
+plugins:
+  enabled:
+    - "web-search"
+    - "web-fetch"
+    - "memory"
+
+# Memory configuration
+memory:
+  enabled: true
+  storage_path: "/data/memory"
+
+# Logging
+logging:
+  level: "info"
+  format: "json"
+  
+# Tenant identification (for logging/debugging)
+tenant:
+  name: "{{ tenant_name }}"
+  instance: "{{ instance_num | default(1) }}"

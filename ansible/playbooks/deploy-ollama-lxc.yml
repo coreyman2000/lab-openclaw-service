@@ -1,0 +1,123 @@
+---
+- name: Deploy Ollama LXC Containers on GPU Nodes
+  hosts: ollama_backends
+  become: true
+  gather_facts: true
+
+  vars:
+    ollama_lxc_template: "ubuntu-24.04-standard"
+    ollama_storage: "local-zfs"
+    ollama_memory: 32768  # 32GB for GPU workloads
+    ollama_cores: 8
+    
+  tasks:
+    - name: Skip if not GPU node
+      ansible.builtin.meta: end_play
+      when: not (gpu_node | default(false))
+
+    - name: Get GPU information
+      ansible.builtin.shell: |
+        nvidia-smi --query-gpu=gpu_uuid,name --format=csv,noheader 2>/dev/null || echo ""
+      register: gpu_info
+      changed_when: false
+
+    - name: Parse GPU list
+      ansible.builtin.set_fact:
+        gpu_list: "{{ gpu_info.stdout_lines | select('search', 'GPU-') | map('regex_replace', '^GPU-([0-9a-f-]+),(.*)$', '\\1') | list }}"
+
+    - name: Display GPU configuration
+      ansible.builtin.debug:
+        msg: |
+          Found {{ gpu_list | length }} GPUs on {{ inventory_hostname }}:
+          {{ gpu_info.stdout }}
+
+    - name: Create Ollama LXC per GPU
+      ansible.builtin.include_tasks: tasks/create-ollama-lxc.yml
+      loop: "{{ gpu_list }}"
+      loop_control:
+        loop_var: gpu_uuid
+        index_var: gpu_index
+
+- name: Configure Ollama Services
+  hosts: ollama_backends
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Skip if not GPU node
+      ansible.builtin.meta: end_play
+      when: not (gpu_node | default(false))
+
+    - name: Wait for LXCs to be ready
+      ansible.builtin.wait_for:
+        host: "10.0.10.{{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + item }}"
+        port: 22
+        timeout: 300
+      loop: "{{ range(1, (gpu_list | default([])) | length + 1) | list }}"
+      ignore_errors: true
+
+    - name: Configure each Ollama LXC
+      ansible.builtin.include_tasks: tasks/configure-ollama-lxc.yml
+      loop: "{{ range(1, (gpu_list | default([])) | length + 1) | list }}"
+      loop_control:
+        loop_var: lxc_id
+
+- name: Deploy Ollama Models
+  hosts: ollama_backends
+  become: true
+  gather_facts: false
+
+  tasks:
+    - name: Skip if not GPU node
+      ansible.builtin.meta: end_play
+      when: not (gpu_node | default(false))
+
+    - name: Pull default models in each LXC
+      ansible.builtin.shell: |
+        pct exec {{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + item }} -- \
+          /usr/local/bin/ollama pull llama3.2
+      loop: "{{ range(1, (gpu_list | default([])) | length + 1) | list }}"
+      async: 600
+      poll: 0
+      register: model_pulls
+
+    - name: Wait for model pulls to complete
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+        mode: status
+      loop: "{{ model_pulls.results }}"
+      register: pull_results
+      until: pull_results.finished is defined and pull_results.finished
+      retries: 60
+      delay: 10
+      ignore_errors: true
+
+- name: Display Ollama Endpoints
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  tasks:
+    - name: Generate endpoint list
+      ansible.builtin.set_fact:
+        ollama_endpoint_list: "{{ ollama_endpoint_list | default([]) + [
+          'http://' + hostvars[item]['ansible_host'] + ':11434'
+        ] }}"
+      loop: "{{ groups['ollama_backends'] }}"
+      when: hostvars[item].gpu_node | default(false)
+
+    - name: Show service endpoints
+      ansible.builtin.debug:
+        msg: |
+          Ollama Backend Endpoints:
+          =========================
+          {% for host in groups['ollama_backends'] %}
+          {% if hostvars[host].gpu_node | default(false) %}
+          {{ host }} ({{ hostvars[host]['ansible_host'] }}):
+            {% for gpu in hostvars[host].gpu_list | default([]) %}
+            - LXC {{ 100 + (loop.index0 * 10) + loop.index }}: http://{{ hostvars[host]['ansible_host'] }}:11434
+            {% endfor %}
+          {% endif %}
+          {% endfor %}
+          
+          Update your tenant configurations with these endpoints.

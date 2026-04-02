@@ -1,0 +1,8 @@
+[
+{% for key in tenant_keys %}
+  {
+    "tenant": "{{ key.tenant }}",
+    "key": "{{ key.key }}"
+  }{{ ',' if not loop.last else '' }}
+{% endfor %}
+]

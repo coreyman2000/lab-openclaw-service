@@ -1,0 +1,42 @@
+# OpenClaw Multi-Instance Docker Compose
+# Tenant: {{ tenant_name }}
+# Generated: {{ ansible_date_time.iso8601 }}
+
+version: "3.8"
+
+services:
+{% for instance_num in range(1, openclaw_instances | int + 1) %}
+  openclaw-{{ instance_num }}:
+    image: {{ openclaw_image | default('ghcr.io/openclaw/openclaw:latest') }}
+    container_name: openclaw-{{ tenant_name }}-{{ instance_num }}
+    restart: unless-stopped
+    ports:
+      - "{{ 3000 + instance_num - 1 }}:3000"
+    volumes:
+      - ./instance-{{ instance_num }}:/data
+      - ./instance-{{ instance_num }}/config.yaml:/app/config.yaml:ro
+    environment:
+      - OPENCLAW_INSTANCE_NAME={{ tenant_name }}-{{ instance_num }}
+      - OPENCLAW_TENANT={{ tenant_name }}
+      - OPENCLAW_MODEL_ENDPOINTS={{ ollama_secure_endpoints | default(ollama_endpoints) | default(default_ollama_endpoints) | join(',') }}
+      - OPENCLAW_API_KEY={{ tenant_api_key | default('') }}
+      - NODE_ENV=production
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - openclaw-net
+    labels:
+      - "tenant={{ tenant_name }}"
+      - "instance={{ instance_num }}"
+      - "tier={{ tenant_tier }}"
+{% endfor %}
+
+networks:
+  openclaw-net:
+    driver: bridge
+    labels:
+      - "tenant={{ tenant_name }}"

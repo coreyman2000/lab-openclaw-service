@@ -1,0 +1,48 @@
+---
+# Task: Configure Ollama LXC Container
+
+- name: Calculate LXC ID for configuration
+  ansible.builtin.set_fact:
+    current_lxc_id: "{{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + lxc_id }}"
+    current_lxc_ip: "10.0.10.{{ 100 + (groups['ollama_backends'].index(inventory_hostname) * 10) + lxc_id }}"
+
+- name: Wait for Ollama API to be ready
+  ansible.builtin.uri:
+    url: "http://{{ current_lxc_ip }}:11434/api/tags"
+    method: GET
+    status_code: 200
+    timeout: 30
+  register: ollama_health
+  until: ollama_health.status == 200
+  retries: 10
+  delay: 5
+
+- name: Verify GPU access in LXC
+  ansible.builtin.shell: |
+    pct exec {{ current_lxc_id }} -- nvidia-smi --query-gpu=name,memory.total --format=csv
+  register: gpu_check
+  changed_when: false
+
+- name: Display GPU status
+  ansible.builtin.debug:
+    msg: "LXC {{ current_lxc_id }} GPU status: {{ gpu_check.stdout }}"
+
+- name: Pull default models
+  ansible.builtin.shell: |
+    pct exec {{ current_lxc_id }} -- ollama pull {{ item }}
+  loop:
+    - llama3.2
+    - mistral
+  args:
+    executable: /bin/bash
+  async: 600
+  poll: 0
+  register: model_pull
+
+- name: Wait for model pull
+  ansible.builtin.async_status:
+    jid: "{{ model_pull.ansible_job_id }}"
+    mode: status
+  until: model_pull.finished is defined and model_pull.finished
+  retries: 60
+  delay: 10
